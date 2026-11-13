@@ -585,6 +585,9 @@ class ExecutionEngine:
             self.crawl(result)
             return
 
+        if isinstance(result, Response) and self._response_is_duplicate(result):
+            return
+
         try:
             yield self.scraper.enqueue_scrape(result, request)
         except Exception:
@@ -592,6 +595,28 @@ class ExecutionEngine:
             logger.exception(
                 "Error while enqueuing scrape", extra={"spider": self.spider}
             )
+
+    def _response_is_duplicate(self, response: Response) -> bool:
+        """Return ``True`` if *response* repeats content already downloaded,
+        and report it as a duplicate.
+
+        The response, not the request, is the unit of duplicate filtering
+        because different URLs can serve the same content. Only the default
+        scheduler exposes its dupefilter, so the filtering is skipped with
+        custom schedulers that do not.
+        """
+        assert self._slot is not None
+        dupefilter = getattr(self._slot.scheduler, "df", None)
+        if dupefilter is None:
+            return False
+        response_seen = getattr(dupefilter, "response_seen", None)
+        if response_seen is None or not response_seen(response):
+            return False
+        log_response = getattr(dupefilter, "log_response", None)
+        if log_response is not None:
+            assert self.spider is not None
+            log_response(response, self.spider)
+        return True
 
     def spider_is_idle(self) -> bool:
         if self._slot is None:
