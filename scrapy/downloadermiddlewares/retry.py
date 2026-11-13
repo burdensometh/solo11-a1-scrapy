@@ -12,7 +12,14 @@ from __future__ import annotations
 from logging import Logger, getLevelNamesMapping, getLogger
 from typing import TYPE_CHECKING, Self
 
-from scrapy.exceptions import NotConfigured
+from twisted.internet.error import ConnectError, ConnectionClosed
+from twisted.internet.error import TimeoutError as TwistedTimeoutError
+
+from scrapy.exceptions import (
+    DownloadConnectionRefusedError,
+    DownloadTimeoutError,
+    NotConfigured,
+)
 from scrapy.utils.decorators import _warn_spider_arg
 from scrapy.utils.misc import _load_objects
 from scrapy.utils.python import global_object_name
@@ -27,6 +34,42 @@ if TYPE_CHECKING:
 
 
 retry_logger = getLogger(__name__)
+
+# Methods that a retry may submit again, duplicating its effects on the server.
+_NON_IDEMPOTENT_METHODS = frozenset({"POST", "PUT"})
+
+# 4xx responses that indicate a temporary condition of the server or client,
+# unlike the rest of the 4xx range, which indicates a request that will keep
+# failing if it is repeated.
+_RETRYABLE_4XX_CODES = frozenset({408, 429})
+
+_TIMEOUT_ERRORS: tuple[type[Exception], ...] = (
+    DownloadTimeoutError,
+    TwistedTimeoutError,
+    TimeoutError,
+)
+
+_CONNECTION_ERRORS: tuple[type[Exception], ...] = (
+    DownloadConnectionRefusedError,
+    ConnectError,
+    ConnectionClosed,
+)
+
+# Delays, in seconds, before each successive retry of a request that timed
+# out. Further retries also wait for the last delay.
+_TIMEOUT_RETRY_DELAYS = (1, 5, 30)
+
+
+def _is_timeout(reason: object) -> bool:
+    if isinstance(reason, type):
+        return issubclass(reason, _TIMEOUT_ERRORS)
+    return isinstance(reason, _TIMEOUT_ERRORS)
+
+
+def _is_connection_error(exception: Exception) -> bool:
+    # A timeout is not a connection error: the connection may have been
+    # established and the request delivered before the timeout happened.
+    return isinstance(exception, _CONNECTION_ERRORS) and not _is_timeout(exception)
 
 
 def get_retry_request(
@@ -106,6 +149,16 @@ def get_retry_request(
         new_request: Request = request.copy()
         new_request.meta["retry_times"] = retry_times
         new_request.meta["skip_dupefilter_once"] = True
+        delay = new_request.meta.pop("delay", None)
+        if _is_timeout(reason):
+            retry_delay = _TIMEOUT_RETRY_DELAYS[
+                min(retry_times, len(_TIMEOUT_RETRY_DELAYS)) - 1
+            ]
+            previous = new_request.meta.pop("_retry_delay", 0)
+            new_request.meta["_retry_delay"] = retry_delay
+            new_request.meta["delay"] = max(delay or 0, retry_delay + previous)
+        elif delay is not None:
+            new_request.meta["delay"] = delay
         if priority_adjust is None:
             priority_adjust = settings.getint("RETRY_PRIORITY_ADJUST")
         new_request.priority = request.priority + priority_adjust
