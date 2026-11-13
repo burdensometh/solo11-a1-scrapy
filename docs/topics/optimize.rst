@@ -370,7 +370,7 @@ For broad crawls, consider these adjustments:
 
     -   Set :setting:`CONCURRENT_REQUESTS` as close to
         :setting:`CONCURRENT_REQUESTS_PER_DOMAIN` × [number of target domains]
-        (e.g. 8 × 10 domains = 80 concurrent requests) as your CPU and memory
+        (e.g. 4 × 10 domains = 40 concurrent requests) as your CPU and memory
         allow.
 
     -   Increase :setting:`RESPONSE_MAX_ACTIVE_SIZE` when increasing

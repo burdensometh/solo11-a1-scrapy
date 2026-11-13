@@ -16,7 +16,11 @@ from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
 from scrapy import Request, Spider, signals
 from scrapy.core.downloader.handlers import DownloadHandlers
 from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
-from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
+from scrapy.exceptions import (
+    DownloadCancelledError,
+    DownloadTimeoutError,
+    ScrapyDeprecationWarning,
+)
 from scrapy.resolver import dnscache
 from scrapy.settings import SETTINGS_PRIORITIES
 from scrapy.utils.asyncio import (
@@ -82,6 +86,19 @@ def _examples(responses: Iterable[Response]) -> str:
     return examples
 
 
+# Downloader slot
+#
+# A slot limits the requests made to one domain (or IP). Its concurrency
+# adapts to timeouts: consecutive timeouts halve it, down to 1, and a slot
+# that stops timing out gains one level back for each minute without one.
+
+# Minimum concurrency of a slot that has slowed down because of timeouts.
+_MIN_SLOT_CONCURRENCY = 1
+# Seconds without a timeout after which a slowed-down slot gains one
+# concurrency level back.
+_SLOT_RECOVERY_INTERVAL = 60.0
+
+
 @dataclass(slots=True, eq=False)
 class Slot:
     """Downloader slot"""
@@ -100,6 +117,14 @@ class Slot:
     # Number of requests in queue not sent with
     # ExecutionEngine.download_async().
     _scheduled_queued: int = field(default=0, init=False, repr=False)
+    # Concurrency the slot started with, the ceiling of timeout adaptation.
+    base_concurrency: int = field(default=0, init=False, repr=False)
+    # Timeouts in a row since the last successful download.
+    consecutive_timeouts: int = field(default=0, init=False, repr=False)
+    # How many times timeouts lowered the concurrency.
+    slowdown_count: int = field(default=0, init=False, repr=False)
+    # monotonic() time of the last timeout, when recovery timing starts.
+    last_timeout: float = field(default=0.0, init=False, repr=False)
 
     # Hand-written to accept the deprecated randomize_delay parameter, which
     # means it also has to initialize the fields above.
@@ -132,6 +157,10 @@ class Slot:
         self.lastseen = 0
         self.latercall = None
         self._scheduled_queued = 0
+        self.base_concurrency = concurrency
+        self.consecutive_timeouts = 0
+        self.slowdown_count = 0
+        self.last_timeout = 0.0
 
     @property
     def randomize_delay(self) -> bool:
@@ -160,6 +189,46 @@ class Slot:
         # A jitter above 1 would reach into negative delays, floored at 0.
         return max(0.0, self.delay * (1 + random.uniform(-self.jitter, self.jitter)))  # noqa: S311
 
+    def note_timeout(self, now: float) -> bool:
+        """Account for a timed-out download and lower the concurrency when
+        another level is available.
+
+        Return whether the concurrency changed.
+        """
+        self.consecutive_timeouts += 1
+        self.last_timeout = now
+        # A concurrency of 0 means unlimited, which timeouts cannot lower.
+        if self.concurrency <= _MIN_SLOT_CONCURRENCY:
+            return False
+        # Halving rounds down: 4 -> 2 -> 1, 8 -> 4 -> 2 -> 1.
+        self.concurrency = max(_MIN_SLOT_CONCURRENCY, self.concurrency // 2)
+        self.slowdown_count += 1
+        return True
+
+    def note_success(self) -> None:
+        """Account for a download that did not time out, ending any run of
+        consecutive timeouts."""
+        self.consecutive_timeouts = 0
+
+    def recover(self, now: float) -> bool:
+        """Raise the concurrency by one level when the slot has spent
+        _SLOT_RECOVERY_INTERVAL seconds without a timeout below its base
+        concurrency.
+
+        Return whether the concurrency changed.
+        """
+        if (
+            self.concurrency >= self.base_concurrency
+            or not self.base_concurrency
+            or not self.last_timeout
+            or now - self.last_timeout < _SLOT_RECOVERY_INTERVAL
+        ):
+            return False
+        self.concurrency += 1
+        # The next level also waits for a timeout-free interval.
+        self.last_timeout = now
+        return True
+
     def close(self) -> None:
         if self.latercall:
             self.latercall.cancel()
@@ -168,6 +237,8 @@ class Slot:
     def __str__(self) -> str:
         return (
             f"<downloader.Slot concurrency={self.concurrency!r} "
+            f"base_concurrency={self.base_concurrency!r} "
+            f"slowdown_count={self.slowdown_count} "
             f"delay={self.delay:.2f} jitter={self.jitter!r} "
             f"len(active)={len(self.active)} len(queue)={len(self.queue)} "
             f"len(transferring)={len(self.transferring)} "
@@ -226,6 +297,8 @@ _STAMPED_SLOT_META_KEY = "_download_slot_stamp"
 class Downloader:
     DOWNLOAD_SLOT = "download_slot"
     _SLOT_GC_INTERVAL: float = 60.0  # seconds
+    # How often slots that timeouts slowed down are given concurrency back.
+    _SLOT_RECOVERY_LOOP_INTERVAL: float = 10.0  # seconds
     # Seconds that requests held back by RESPONSE_MAX_ACTIVE_SIZE wait for a
     # release before one of them is let through.
     _SIZE_BYPASS_DELAY: float = 5.0
@@ -250,6 +323,9 @@ class Downloader:
             DownloaderMiddlewareManager, crawler
         )
         self._slot_gc_loop: AsyncioLoopingCall[..., None] | LoopingCall | None = None
+        self._slot_recovery_loop: AsyncioLoopingCall[..., None] | LoopingCall | None = (
+            None
+        )
         self._accepting_requests: bool = True
         self._download_tasks: dict[Request, Deferred[None]] = {}
         self.per_slot_settings: dict[str, dict[str, Any]] = self.settings.getdict(
@@ -439,6 +515,14 @@ class Downloader:
             new_slot = Slot(conc, delay, _slot_jitter(slot_settings, self._jitter))
             self.slots[key] = new_slot
             self._start_slot_gc()
+            self._start_slot_recovery()
+            if self._stats is not None:
+                self._stats.set_value(
+                    f"downloader/slot/{key}/concurrency", new_slot.concurrency
+                )
+                self._stats.set_value(
+                    f"downloader/slot/{key}/slowdown_count", new_slot.slowdown_count
+                )
 
         return key, self.slots[key]
 
@@ -540,7 +624,9 @@ class Downloader:
             else:
                 slot._scheduled_queued -= 1
             download_dfd = deferred_from_coro(
-                self._wait_for_download(slot, request, queue_dfd)
+                self._wait_for_download(
+                    slot, request, queue_dfd, request.meta[self.DOWNLOAD_SLOT]
+                )
             )
             assert isinstance(download_dfd, Deferred)
             self._download_tasks[request] = download_dfd
@@ -734,15 +820,71 @@ class Downloader:
         )
 
     async def _wait_for_download(
-        self, slot: Slot, request: Request, queue_dfd: Deferred[Response]
+        self,
+        slot: Slot,
+        request: Request,
+        queue_dfd: Deferred[Response],
+        slot_key: str,
     ) -> None:
         try:
             response = await self._download(slot, request)
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, DownloadTimeoutError):
+                self._note_slot_timeout(slot, slot_key)
+            else:
+                # A failure that is not a timeout, or a cancellation, breaks a
+                # run of consecutive timeouts.
+                slot.note_success()
             if not queue_dfd.called:
                 queue_dfd.errback(exc)
         else:
+            slot.note_success()
             queue_dfd.callback(response)  # awaited in _enqueue_request()
+
+    def _note_slot_timeout(self, slot: Slot, slot_key: str) -> None:
+        """Lower the concurrency of *slot* when another timeout level is
+        available and expose the new concurrency and the slowdown count."""
+        changed = slot.note_timeout(monotonic())
+        if self._stats is not None:
+            self._stats.set_value(
+                f"downloader/slot/{slot_key}/concurrency", slot.concurrency
+            )
+            self._stats.set_value(
+                f"downloader/slot/{slot_key}/slowdown_count", slot.slowdown_count
+            )
+        if changed:
+            logger.info(
+                f"Slowing down download slot {slot_key!r}: concurrency lowered to "
+                f"{slot.concurrency} after {slot.consecutive_timeouts} consecutive "
+                f"timeout{'s' if slot.consecutive_timeouts > 1 else ''}."
+            )
+
+    def _recover_slots(self) -> None:
+        """Give slowed-down slots concurrency back, one level per timeout-free
+        _SLOT_RECOVERY_INTERVAL, and expose the new concurrency."""
+        now = monotonic()
+        for key, slot in self.slots.items():
+            if not slot.recover(now):
+                continue
+            if self._stats is not None:
+                self._stats.set_value(
+                    f"downloader/slot/{key}/concurrency", slot.concurrency
+                )
+            logger.info(
+                f"Download slot {key!r} recovered: concurrency raised to "
+                f"{slot.concurrency}."
+            )
+
+    def _start_slot_recovery(self) -> None:
+        if self._slot_recovery_loop:
+            return
+        self._slot_recovery_loop = create_looping_call(self._recover_slots)
+        self._slot_recovery_loop.start(self._SLOT_RECOVERY_LOOP_INTERVAL, now=False)
+
+    def _stop_slot_recovery(self) -> None:
+        if self._slot_recovery_loop:
+            self._slot_recovery_loop.stop()
+            self._slot_recovery_loop = None
 
     async def stop(self) -> int:
         self._accepting_requests = False
@@ -787,6 +929,7 @@ class Downloader:
     def close(self) -> None:
         self._accepting_requests = False
         self._stop_slot_gc()
+        self._stop_slot_recovery()
         for slot in self.slots.values():
             slot.close()
         self._cancel_size_bypass()

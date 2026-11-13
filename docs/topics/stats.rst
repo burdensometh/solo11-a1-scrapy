@@ -237,6 +237,21 @@ one per actual value of the placeholder.
 
     Set by :class:`~scrapy.downloadermiddlewares.stats.DownloaderStats`.
 
+.. stat:: downloader/slot/{slot_name}/concurrency
+
+``downloader/slot/{slot_name}/concurrency``
+    Current concurrency of the downloader slot named ``{slot_name}``, usually
+    the domain of the requests it holds. It starts at the slot's configured
+    concurrency, halves when its requests time out repeatedly, down to one,
+    and rises back one level at a time after timeout-free minutes. See
+    :setting:`CONCURRENT_REQUESTS_PER_DOMAIN`.
+
+.. stat:: downloader/slot/{slot_name}/slowdown_count
+
+``downloader/slot/{slot_name}/slowdown_count``
+    Number of times consecutive timeouts lowered the concurrency of the
+    downloader slot named ``{slot_name}``.
+
 .. stat:: dupefilter/filtered
 
 ``dupefilter/filtered``

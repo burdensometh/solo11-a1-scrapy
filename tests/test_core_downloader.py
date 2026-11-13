@@ -37,7 +37,11 @@ from scrapy.core.downloader.contextfactory import (
 )
 from scrapy.core.downloader.handlers.base import BaseDownloadHandler
 from scrapy.core.downloader.handlers.http11 import _RequestBodyProducer
-from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
+from scrapy.exceptions import (
+    DownloadCancelledError,
+    DownloadTimeoutError,
+    ScrapyDeprecationWarning,
+)
 from scrapy.http import Response
 from scrapy.resolver import dnscache
 from scrapy.utils._deps_compat import PYOPENSSL_SET_CIPHER_LIST_TMP_CONN
@@ -124,6 +128,88 @@ class TestSlot:
         ):
             slot.randomize_delay = value
         assert slot.jitter == expected
+
+    @pytest.mark.parametrize(
+        ("base", "levels"),
+        [
+            (4, (2, 1)),
+            (8, (4, 2, 1)),
+            (3, (1,)),
+            (2, (1,)),
+            (1, ()),
+        ],
+    )
+    def test_note_timeout_lowers_concurrency(
+        self, base: int, levels: tuple[int, ...]
+    ) -> None:
+        slot = Slot(concurrency=base, delay=0, jitter=0)
+        assert slot.base_concurrency == base
+        assert slot.slowdown_count == 0
+        now = 100.0
+        for index, expected in enumerate(levels, start=1):
+            assert slot.note_timeout(now + index) is True
+            assert slot.concurrency == expected
+            assert slot.consecutive_timeouts == index
+            assert slot.slowdown_count == index
+        # At the minimum, further timeouts keep counting but do not lower
+        # the concurrency again.
+        before = slot.slowdown_count
+        assert slot.note_timeout(now + len(levels) + 1) is False
+        assert slot.concurrency == max(1, levels[-1]) if levels else 1
+        assert slot.consecutive_timeouts == len(levels) + 1
+        assert slot.slowdown_count == before
+
+    def test_note_success_resets_consecutive_timeouts(self) -> None:
+        slot = Slot(concurrency=4, delay=0, jitter=0)
+        slot.note_timeout(100.0)
+        assert slot.concurrency == 2
+        slot.note_success()
+        assert slot.consecutive_timeouts == 0
+        # The lowered concurrency is left for the recovery loop to restore.
+        assert slot.concurrency == 2
+        # A timeout after a success starts a new streak and lowers again.
+        assert slot.note_timeout(200.0) is True
+        assert slot.concurrency == 1
+        assert slot.consecutive_timeouts == 1
+        assert slot.slowdown_count == 2
+
+    @pytest.mark.parametrize("base", [1, 2, 4, 8])
+    def test_recover_one_level_per_minute(self, base: int) -> None:
+        slot = Slot(concurrency=base, delay=0, jitter=0)
+        # Slow the slot all the way down.
+        steps = 0
+        while slot.concurrency > 1:
+            steps += 1
+            assert slot.note_timeout(100.0 + steps) is True
+        last_timeout = slot.last_timeout
+        # Nothing happens before a minute without a timeout.
+        assert slot.recover(last_timeout + 59.9) is False
+        level = 1
+        while level < base:
+            assert slot.recover(last_timeout + 60.0) is True
+            level += 1
+            assert slot.concurrency == level
+            # Each step restarts the one-minute wait.
+            last_timeout = slot.last_timeout
+        # The base concurrency is the ceiling.
+        assert slot.recover(last_timeout + 60.0) is False
+        assert slot.concurrency == base
+
+    def test_recover_without_timeout(self) -> None:
+        slot = Slot(concurrency=4, delay=0, jitter=0)
+        assert slot.recover(monotonic()) is False
+        assert slot.concurrency == 4
+
+    def test_unlimited_concurrency_is_not_lowered(self) -> None:
+        # A concurrency of 0 means unlimited and stays untouched by timeouts,
+        # so that halving it cannot turn it into a finite limit.
+        slot = Slot(concurrency=0, delay=0, jitter=0)
+        assert slot.note_timeout(100.0) is False
+        assert slot.concurrency == 0
+        assert slot.slowdown_count == 0
+        assert slot.consecutive_timeouts == 1
+        assert slot.recover(200.0) is False
+        assert slot.concurrency == 0
 
 
 class TestJitterSetting:
@@ -750,6 +836,7 @@ async def test_wait_for_download_errbacks_queue_deferred_on_error() -> None:
             slot,
             Request("https://example.com"),
             queue_dfd,
+            "example.com",
         )
 
     assert len(failures) == 1
@@ -770,6 +857,7 @@ async def test_wait_for_download_keeps_called_queue_deferred_on_error() -> None:
             slot,
             Request("https://example.com"),
             queue_dfd,
+            "example.com",
         )
 
     assert queue_dfd.called
@@ -888,6 +976,341 @@ async def test_slot_concurrency() -> None:
     assert crawler.stats.get_value("response_received_count") == 10
 
 
+class TimingOutSpider(MockServerSpider):
+    """Requests to /wait never get a response, so they hit DOWNLOAD_TIMEOUT."""
+
+    name = "timing_out"
+    custom_settings: dict[str, Any] = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_TIMEOUT": 0.2,
+        "RETRY_ENABLED": False,
+    }
+
+    async def start(self):
+        assert self.mockserver
+        for _ in range(3):
+            yield Request(self.mockserver.url("/wait"), dont_filter=True)
+
+    def parse(self, response):
+        pass
+
+
+@pytest.mark.requires_reactor
+@coroutine_test
+async def test_timeouts_lower_slot_concurrency_end_to_end(
+    mockserver: MockServer,
+) -> None:
+    crawler = get_crawler(TimingOutSpider)
+    await crawler.crawl_async(mockserver=mockserver)
+    downloader = crawler.engine.downloader
+    (slot_key, slot) = next(iter(downloader.slots.items()))
+    # 4 -> 2 after the first timeout, 2 -> 1 after the second; the third
+    # cannot lower it below 1, so it only extends the timeout streak.
+    assert slot.base_concurrency == 4
+    assert slot.concurrency == 1
+    assert slot.consecutive_timeouts == 3
+    assert slot.slowdown_count == 2
+    assert crawler.stats.get_value(f"downloader/slot/{slot_key}/concurrency") == 1
+    assert crawler.stats.get_value(f"downloader/slot/{slot_key}/slowdown_count") == 2
+    assert crawler.stats.get_value("downloader/exception_count") == 3
+
+
+class RecoveringSpider(MockServerSpider):
+    """Times out once, then serves slow successful responses while the
+    recovery loop gives the concurrency back."""
+
+    name = "recovering"
+    custom_settings: dict[str, Any] = {
+        "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+        "DOWNLOAD_TIMEOUT": 0.2,
+        "RETRY_ENABLED": False,
+    }
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.responses = 0
+
+    async def start(self):
+        assert self.mockserver
+        yield Request(self.mockserver.url("/wait"), dont_filter=True)
+        # Each successful response takes 0.3 s, keeping the crawl and the slot
+        # alive long enough for the shortened recovery interval to elapse. The
+        # per-request timeout is raised above that delay so that these requests
+        # do not time out like the first one.
+        for _ in range(6):
+            yield Request(
+                self.mockserver.url("/delay?n=0.3"),
+                dont_filter=True,
+                meta={"download_timeout": 2},
+            )
+
+    def parse(self, response):
+        self.responses += 1
+
+
+@pytest.mark.requires_reactor
+@coroutine_test
+async def test_slot_concurrency_recovers_end_to_end(
+    mockserver: MockServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Recover one level every 0.1 s instead of every minute, and check often.
+    monkeypatch.setattr(Downloader, "_SLOT_RECOVERY_LOOP_INTERVAL", 0.02)
+    monkeypatch.setattr("scrapy.core.downloader._SLOT_RECOVERY_INTERVAL", 0.1)
+    crawler = get_crawler(RecoveringSpider)
+    await crawler.crawl_async(mockserver=mockserver)
+    slot_key = mockserver.host
+    # The timeout lowered 4 -> 2, then successful requests and the recovery
+    # loop brought it back to the base concurrency.
+    assert crawler.stats.get_value(f"downloader/slot/{slot_key}/slowdown_count") == 1
+    assert crawler.stats.get_value(f"downloader/slot/{slot_key}/concurrency") == 4
+    assert crawler.stats.get_value("response_received_count") == 6
+
+
+class _TimeoutHandler(BaseDownloadHandler):
+    """Download handler that raises DownloadTimeoutError, like a real handler
+    does when DOWNLOAD_TIMEOUT elapses."""
+
+    async def download_request(self, request: Request) -> Response:
+        raise DownloadTimeoutError(request.url)
+
+
+class _FailingHandler(BaseDownloadHandler):
+    """Download handler that fails with an error that is not a timeout."""
+
+    async def download_request(self, request: Request) -> Response:
+        raise ConnectionRefusedError(request.url)
+
+
+@coroutine_test
+async def test_default_slot_concurrency_is_four() -> None:
+    crawler = get_crawler(DefaultSpider)
+    crawler.spider = crawler._create_spider()
+    downloader = Downloader(crawler)
+    try:
+        _, slot = downloader._get_slot(Request("https://example.com"))
+        assert slot.base_concurrency == 4
+        assert slot.concurrency == 4
+    finally:
+        downloader.close()
+
+
+class TestSlotAdaptiveConcurrency:
+    @staticmethod
+    def _downloader() -> Downloader:
+        crawler = get_crawler(
+            DefaultSpider,
+            {
+                "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+                "DOWNLOAD_HANDLERS": {"https": _TimeoutHandler},
+                "RETRY_ENABLED": False,
+            },
+        )
+        crawler.spider = crawler._create_spider()
+        return Downloader(crawler)
+
+    @coroutine_test
+    async def test_timeout_lowers_concurrency_and_publishes_stats(self) -> None:
+        downloader = self._downloader()
+        crawler = downloader.crawler
+        request = Request("https://example.com")
+        try:
+            with pytest.raises(DownloadTimeoutError):
+                await maybe_deferred_to_future(downloader.fetch(request))
+            slot = downloader.slots["example.com"]
+            assert slot.concurrency == 2
+            assert slot.base_concurrency == 4
+            assert slot.consecutive_timeouts == 1
+            assert slot.slowdown_count == 1
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/concurrency") == 2
+            )
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/slowdown_count")
+                == 1
+            )
+
+            with pytest.raises(DownloadTimeoutError):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://example.com/other"))
+                )
+            assert slot.concurrency == 1
+            assert slot.consecutive_timeouts == 2
+            assert slot.slowdown_count == 2
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/concurrency") == 1
+            )
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/slowdown_count")
+                == 2
+            )
+
+            # At the minimum, another timeout keeps counting but does not
+            # lower the concurrency or the slowdown count again.
+            with pytest.raises(DownloadTimeoutError):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://example.com/third"))
+                )
+            assert slot.concurrency == 1
+            assert slot.consecutive_timeouts == 3
+            assert slot.slowdown_count == 2
+        finally:
+            downloader.close()
+            await downloader.handlers._close()
+
+    @coroutine_test
+    async def test_other_slots_keep_their_own_concurrency(self) -> None:
+        downloader = self._downloader()
+        try:
+            with pytest.raises(DownloadTimeoutError):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://slow.example"))
+                )
+            slow = downloader.slots["slow.example"]
+            assert slow.concurrency == 2
+            _, healthy = downloader._get_slot(Request("https://fast.example"))
+            assert healthy.concurrency == 4
+            assert healthy.slowdown_count == 0
+        finally:
+            downloader.close()
+            await downloader.handlers._close()
+
+    @coroutine_test
+    async def test_non_timeout_failure_resets_consecutive_timeouts(self) -> None:
+        crawler = get_crawler(
+            DefaultSpider,
+            {
+                "CONCURRENT_REQUESTS_PER_DOMAIN": 4,
+                "DOWNLOAD_HANDLERS": {"https": _FailingHandler},
+                "RETRY_ENABLED": False,
+            },
+        )
+        crawler.spider = crawler._create_spider()
+        downloader = Downloader(crawler)
+        try:
+            # First slow the slot down with a timeout.
+            with (
+                patch.object(
+                    downloader.handlers,
+                    "download_request_async",
+                    side_effect=DownloadTimeoutError("timeout"),
+                ),
+                pytest.raises(DownloadTimeoutError),
+            ):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://example.com"))
+                )
+            slot = downloader.slots["example.com"]
+            assert slot.concurrency == 2
+            assert slot.consecutive_timeouts == 1
+
+            # A different failure does not count as a timeout and ends the run.
+            with pytest.raises(ConnectionRefusedError):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://example.com/other"))
+                )
+            assert slot.consecutive_timeouts == 0
+            assert slot.concurrency == 2
+            assert slot.slowdown_count == 1
+        finally:
+            downloader.close()
+            await downloader.handlers._close()
+
+    @coroutine_test
+    async def test_gc_slot_resets_its_state_and_stats(self) -> None:
+        downloader = self._downloader()
+        crawler = downloader.crawler
+        try:
+            with pytest.raises(DownloadTimeoutError):
+                await maybe_deferred_to_future(
+                    downloader.fetch(Request("https://example.com"))
+                )
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/concurrency") == 2
+            )
+            # Garbage-collect the idle slot, then visit the domain again.
+            downloader._slot_gc(age=0)
+            assert "example.com" not in downloader.slots
+            _, slot = downloader._get_slot(Request("https://example.com"))
+            assert slot.concurrency == 4
+            assert slot.slowdown_count == 0
+            assert slot.consecutive_timeouts == 0
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/concurrency") == 4
+            )
+            assert (
+                crawler.stats.get_value("downloader/slot/example.com/slowdown_count")
+                == 0
+            )
+        finally:
+            downloader.close()
+            await downloader.handlers._close()
+
+
+class TestSlotRecovery:
+    @staticmethod
+    def _downloader() -> Downloader:
+        crawler = get_crawler(
+            DefaultSpider,
+            {"CONCURRENT_REQUESTS_PER_DOMAIN": 4},
+        )
+        crawler.spider = crawler._create_spider()
+        return Downloader(crawler)
+
+    @coroutine_test
+    async def test_recovery_restores_one_level_per_interval(self) -> None:
+        downloader = self._downloader()
+        crawler = downloader.crawler
+        try:
+            _, slot = downloader._get_slot(Request("https://example.com"))
+            # Simulate two consecutive timeouts: 4 -> 2 -> 1.
+            downloader._note_slot_timeout(slot, "example.com")
+            downloader._note_slot_timeout(slot, "example.com")
+            assert slot.concurrency == 1
+
+            base = monotonic()
+            with patch(
+                "scrapy.core.downloader.monotonic",
+                lambda: base + 30.0,
+            ):
+                downloader._recover_slots()
+            assert slot.concurrency == 1
+
+            # Each minute without a timeout restores one level. The recovery
+            # restarts the one-minute wait for the next level.
+            for elapsed, expected in ((60.0, 2), (120.0, 3), (180.0, 4)):
+                with patch(
+                    "scrapy.core.downloader.monotonic",
+                    lambda elapsed=elapsed: base + elapsed,
+                ):
+                    downloader._recover_slots()
+                assert slot.concurrency == expected
+                assert (
+                    crawler.stats.get_value("downloader/slot/example.com/concurrency")
+                    == expected
+                )
+
+            # The base concurrency is the ceiling.
+            with patch(
+                "scrapy.core.downloader.monotonic",
+                lambda: base + 300.0,
+            ):
+                downloader._recover_slots()
+            assert slot.concurrency == 4
+        finally:
+            downloader.close()
+            await downloader.handlers._close()
+
+    @coroutine_test
+    async def test_recovery_loop_is_started_and_stopped(self) -> None:
+        downloader = self._downloader()
+        assert downloader._slot_recovery_loop is None
+        downloader._get_slot(Request("https://example.com"))
+        assert downloader._slot_recovery_loop is not None
+        downloader.close()
+        assert downloader._slot_recovery_loop is None
+        await downloader.handlers._close()
+
+
 def test_deprecated_tls_module_names() -> None:
     with pytest.warns(
         ScrapyDeprecationWarning,
@@ -911,8 +1334,9 @@ def test_deprecated_tls_module_names() -> None:
 def test_slot_str() -> None:
     slot = Slot(concurrency=2, delay=0.5, jitter=0)
     assert str(slot).startswith(
-        "<downloader.Slot concurrency=2 delay=0.50 jitter=0"
-        " len(active)=0 len(queue)=0 len(transferring)=0 lastseen="
+        "<downloader.Slot concurrency=2 base_concurrency=2 slowdown_count=0 "
+        "delay=0.50 jitter=0 "
+        "len(active)=0 len(queue)=0 len(transferring)=0 lastseen="
     )
 
 

@@ -175,7 +175,9 @@ whose ``concurrency`` and ``delay`` come from
 :setting:`CONCURRENT_REQUESTS_PER_IP`) and :setting:`DOWNLOAD_DELAY`. A slot
 created later, e.g. for a domain not visited yet, starts from those settings
 again, and :ref:`AutoThrottle <topics-autothrottle>` recalculates ``delay``
-after every response.
+after every response. A slot also exposes ``base_concurrency``, the
+concurrency it started from, and ``slowdown_count``, how many times consecutive
+timeouts lowered its ``concurrency``.
 
 .. skip: end
 

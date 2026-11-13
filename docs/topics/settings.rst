@@ -635,10 +635,21 @@ services, with systemd’s `LimitNOFILE`_; otherwise, lower this setting.
 CONCURRENT_REQUESTS_PER_DOMAIN
 ------------------------------
 
-Default: ``1`` (:ref:`fallback <default-settings>`: ``8``)
+Default: ``1`` (:ref:`fallback <default-settings>`: ``4``)
 
 The maximum number of concurrent (i.e. simultaneous) requests that will be
 performed to any single domain.
+
+The concurrency of a domain adapts to its timeouts. When the requests to a
+domain time out one after another, its concurrency is halved, from its
+configured value down to a minimum of one, so that a domain that answers
+slowly holds fewer of the global concurrency slots. A domain that stops
+timing out gains one concurrency level back for every minute without a
+timeout, until it reaches its configured value again. The current
+concurrency of each domain and the number of times it was slowed down are
+available in the :ref:`stats <topics-stats>` under
+``downloader/slot/<domain>/concurrency`` and
+``downloader/slot/<domain>/slowdown_count``.
 
 See also: :ref:`topics-autothrottle` and its
 :setting:`AUTOTHROTTLE_TARGET_CONCURRENCY` option.
