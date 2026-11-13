@@ -88,6 +88,43 @@ class TestFileFeedStorage:
             storage.open(scrapy.Spider("default"))
         assert path.read_bytes() == b"content"
 
+    def test_written_to_tmp_file_until_stored(self, tmp_path):
+        path = tmp_path / "file.txt"
+        tmp_file = tmp_path / "file.txt.tmp"
+        storage = FileFeedStorage(str(path), feed_options={"mode": "overwrite"})
+        file = storage.open(scrapy.Spider("default"))
+        file.write(b"content")
+        # Until the feed is stored, the data only exists in the temporary
+        # file, so an interrupted run cannot leave a truncated target.
+        assert not path.exists()
+        assert tmp_file.exists()
+        storage.store(file)
+        assert not tmp_file.exists()
+        assert path.read_bytes() == b"content"
+
+    def test_interrupted_run_keeps_previous_file(self, tmp_path):
+        """An interrupted run leaves the previous feed untouched, and its
+        leftover temporary file is removed when the feed is opened again."""
+        path = tmp_path / "file.txt"
+        path.write_bytes(b"previous")
+        tmp_file = tmp_path / "file.txt.tmp"
+        spider = scrapy.Spider("default")
+        storage = FileFeedStorage(str(path), feed_options={"mode": "overwrite"})
+        file = storage.open(spider)
+        file.write(b"partial")
+        # Simulate an interrupted run: store() is never called.
+        file.close()
+        assert path.read_bytes() == b"previous"
+        assert tmp_file.read_bytes() == b"partial"
+        # The next run discards the leftover temporary file.
+        storage = FileFeedStorage(str(path), feed_options={"mode": "overwrite"})
+        file = storage.open(spider)
+        assert tmp_file.read_bytes() == b""
+        file.write(b"content")
+        storage.store(file)
+        assert path.read_bytes() == b"content"
+        assert not tmp_file.exists()
+
     @pytest.mark.parametrize(
         ("feed_options", "expected_write_mode"),
         [

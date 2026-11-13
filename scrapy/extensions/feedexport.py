@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
+import shutil
 import sys
 import warnings
 from abc import ABC, abstractmethod
@@ -254,6 +256,14 @@ class FileFeedStorage:
 
     *uri* may be a ``file://`` URI or a plain path. Missing parent directories
     are created when the feed is opened.
+
+    The feed is written to a ``<path>.tmp`` file first, which is atomically
+    renamed to *path* once the whole feed has been written and flushed, so an
+    interrupted run cannot leave a truncated feed at *path*. A ``<path>.tmp``
+    file left over by an interrupted run is removed when the feed is opened
+    again. While the feed is being written, the number of items written so
+    far is recorded in a ``<path>.state`` JSON file, which resume logic can
+    read after an interruption; the file is removed once the feed is stored.
     """
 
     supported_modes: frozenset[str] = _FEED_MODES
@@ -263,16 +273,38 @@ class FileFeedStorage:
         self.write_mode: OpenBinaryMode = _WRITE_MODES[
             _get_mode(self, feed_options, "append")
         ]
+        self._tmp_path: str = self.path + ".tmp"
+        self._state_path: str = self.path + ".state"
 
     def open(self, spider: Spider) -> IO[bytes]:
         dirname = Path(self.path).parent
         if dirname and not dirname.exists():
             dirname.mkdir(parents=True)
-        return Path(self.path).open(self.write_mode)
+        tmp_path = Path(self._tmp_path)
+        if tmp_path.exists():
+            # Leftover from an interrupted run that never got to rename it.
+            tmp_path.unlink()
+        if self.write_mode == "xb" and Path(self.path).exists():
+            # The create mode forbids an existing target, which is checked
+            # here because the rename in store() would silently replace it.
+            raise FileExistsError(self.path)
+        if self.write_mode == "ab" and Path(self.path).exists():
+            # Seed the temporary file with the current feed, so that the
+            # rename in store() does not lose it.
+            shutil.copyfile(self.path, tmp_path)
+        return tmp_path.open("ab" if self.write_mode == "ab" else "wb")
 
     def store(self, file: IO[bytes]) -> Deferred[None] | None:
         file.close()
+        Path(self._tmp_path).replace(self.path)
+        Path(self._state_path).unlink(missing_ok=True)
         return None
+
+    def _write_state(self, itemcount: int) -> None:
+        """Record *itemcount* in the state file, for resume logic to read if
+        the run is interrupted."""
+        with Path(self._state_path).open("w", encoding="utf-8") as f:
+            json.dump({"itemcount": itemcount}, f)
 
 
 class S3FeedStorage(BlockingFeedStorage):
@@ -999,6 +1031,8 @@ class FeedExporter:
                 # this feed still cover the same items as those of any other
                 # feed.
                 slot.itemcount += 1
+                if not slot._skipped and isinstance(slot.storage, FileFeedStorage):
+                    slot.storage._write_state(slot.itemcount)
                 # create new slot for each slot with itemcount == FEED_EXPORT_BATCH_ITEM_COUNT and close the old one
                 if (
                     self.feeds[slot.uri_template]["batch_item_count"]

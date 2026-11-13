@@ -86,9 +86,10 @@ class DeferredFeedStorage(FileFeedStorage):
     :class:`~twisted.internet.defer.Deferred` object."""
 
     def store(self, file: IO[bytes]) -> Deferred[None]:
+        parent_store = super().store
         d: Deferred[None] = Deferred()
         call_later(0, d.callback, None)
-        return d.addCallback(lambda _: file.close())
+        return d.addCallback(lambda _: parent_store(file))
 
 
 class AsyncJsonLinesItemExporter(CallTracker, JsonLinesItemExporter):

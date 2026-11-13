@@ -171,6 +171,19 @@ specify a path (e.g. ``/tmp/export.csv``). Alternatively, you can use a
 Supported :ref:`modes <feed-mode>`: ``"append"``, ``"create"`` and
 ``"overwrite"``. If :setting:`FEED_MODE` is ``None``, ``"append"`` is used.
 
+Feeds are written to a ``<path>.tmp`` file first, which is atomically
+renamed to *path* once the whole feed has been written and flushed, so an
+interrupted run cannot leave a truncated feed at *path*. A ``<path>.tmp``
+file left over by an interrupted run is removed when the feed is opened
+again. While a feed is being written, the number of items written so far is
+recorded in a ``<path>.state`` JSON file (e.g. ``{"itemcount": 42}``), which
+code that resumes an interrupted run can read; the file is removed once the
+feed is stored.
+
+.. versionchanged:: VERSION
+   Local feeds are written to a temporary file that is atomically renamed to
+   the target path once complete, instead of being written directly to it.
+
 .. _topics-feed-storage-ftp:
 .. _feed-storage-ftp:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 from pathlib import Path
@@ -146,6 +147,85 @@ class TestFeedExporterSignals:
         )
         assert self.feed_slot_closed_received
         assert self.feed_exporter_closed_received
+
+
+class TestFeedExporterStateFile:
+    """While a file feed is being written, the number of exported items is
+    recorded in a state file next to it, which an interrupted run leaves
+    behind for resume logic and which is removed once the feed is stored."""
+
+    items = [
+        {"foo": "bar1"},
+        {"foo": "bar2"},
+        {"foo": "bar3"},
+    ]
+
+    @staticmethod
+    def _get_exporter(tmp_path: Path) -> tuple[FeedExporter, scrapy.Spider, Path]:
+        feed_path = tmp_path / "feed.jsonl"
+        settings = {
+            "FEEDS": {
+                printf_escape(path_to_url(feed_path)): {
+                    "format": "jsonlines",
+                    "mode": "overwrite",
+                },
+            },
+        }
+        crawler = get_crawler(settings_dict=settings)
+        feed_exporter = build_from_crawler(FeedExporter, crawler)
+        spider = scrapy.Spider.from_crawler(crawler, "default")
+        return feed_exporter, spider, feed_path
+
+    @coroutine_test
+    async def test_state_file_removed_on_close(self, tmp_path: Path) -> None:
+        feed_exporter, spider, feed_path = self._get_exporter(tmp_path)
+        tmp_file = Path(f"{feed_path}.tmp")
+        state_file = Path(f"{feed_path}.state")
+        feed_exporter.open_spider(spider)
+        for itemcount, item in enumerate(self.items, start=1):
+            await feed_exporter.item_scraped(item, spider)
+            assert json.loads(state_file.read_bytes()) == {"itemcount": itemcount}
+        # The feed is only moved to its final path when it is closed.
+        assert tmp_file.exists()
+        assert not feed_path.exists()
+        await feed_exporter.close_spider(spider)
+        assert feed_path.exists()
+        assert not tmp_file.exists()
+        assert not state_file.exists()
+
+    @coroutine_test
+    async def test_interrupted_run(self, tmp_path: Path) -> None:
+        feed_exporter, spider, feed_path = self._get_exporter(tmp_path)
+        tmp_file = Path(f"{feed_path}.tmp")
+        state_file = Path(f"{feed_path}.state")
+        feed_exporter.open_spider(spider)
+        await feed_exporter.item_scraped(self.items[0], spider)
+        await feed_exporter.item_scraped(self.items[1], spider)
+        # Simulate an interrupted run: the spider is never closed, and the
+        # half-written temporary file and the state file are left behind.
+        for slot in feed_exporter.slots:
+            assert slot.file is not None
+            slot.file.close()
+        assert json.loads(state_file.read_bytes()) == {"itemcount": 2}
+        assert tmp_file.exists()
+        assert not feed_path.exists()
+        # The next run discards the leftover temporary file, records its own
+        # item count and removes both files once the feed is stored.
+        feed_exporter, spider, feed_path = self._get_exporter(tmp_path)
+        feed_exporter.open_spider(spider)
+        await feed_exporter.item_scraped(self.items[0], spider)
+        # The stale temporary file was discarded when the feed was opened,
+        # and the new one only holds the not-yet-flushed new items.
+        assert tmp_file.read_bytes() == b""
+        for item in self.items[1:]:
+            await feed_exporter.item_scraped(item, spider)
+        assert json.loads(state_file.read_bytes()) == {"itemcount": 3}
+        await feed_exporter.close_spider(spider)
+        assert not tmp_file.exists()
+        assert not state_file.exists()
+        assert feed_path.read_bytes() == (
+            b'{"foo": "bar1"}\n{"foo": "bar2"}\n{"foo": "bar3"}\n'
+        )
 
 
 class TestFeedExportInit:
