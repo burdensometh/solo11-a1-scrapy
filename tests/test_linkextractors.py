@@ -26,6 +26,80 @@ class TestLxmlLinkExtractor:
             isinstance(link.url, str) for link in lx.extract_links(self.response)
         )
 
+    def test_normalize_equivalent_links(self):
+        """Links that only differ in their fragment, in the case of their
+        host, in extra slashes, or in whether their path ends with a slash are
+        extracted once, with the same normalized URL."""
+        body = b"""
+        <html><body>
+        <a href="http://example.com/a/b">1</a>
+        <a href="http://example.com/a/b/#section">2</a>
+        <a href="http://example.com/a//b//">3</a>
+        <a href="HTTP://EXAMPLE.COM/a/b">4</a>
+        <a href="/a/b">5</a>
+        <a href="https://example.com/a/b#other">6</a>
+        </body></html>
+        """
+        response = HtmlResponse("http://example.com/index.html", body=body)
+        assert [link.url for link in LxmlLinkExtractor().extract_links(response)] == [
+            "http://example.com/a/b",
+            "https://example.com/a/b",
+        ]
+        assert [
+            link.url for link in LxmlLinkExtractor(unique=False).extract_links(response)
+        ] == [
+            "http://example.com/a/b",
+            "http://example.com/a/b",
+            "http://example.com/a/b",
+            "http://example.com/a/b",
+            "http://example.com/a/b",
+            "https://example.com/a/b",
+        ]
+
+    @pytest.mark.parametrize(
+        ("href", "expected"),
+        [
+            ("page.html", "http://example.com/dir/page.html"),
+            ("page.html/", "http://example.com/dir/page.html"),
+            ("page.html#frag", "http://example.com/dir/page.html"),
+            ("/page.html/", "http://example.com/page.html"),
+            ("/dir//page.html//", "http://example.com/dir/page.html"),
+            ("HTTP://EXAMPLE.COM/Page.html", "http://example.com/Page.html"),
+            ("./page.html?a=1#f", "http://example.com/dir/page.html?a=1"),
+            ("HTTP://SUB.EXAMPLE.COM/Page.html", "http://sub.example.com/Page.html"),
+            ("http://example.com/dir//", "http://example.com/dir"),
+            ("http://example.com//", "http://example.com/"),
+            ("http://example.com?q=1", "http://example.com/?q=1"),
+            ("http://example.com/a%2Fb/", "http://example.com/a%2Fb"),
+            ("résumé.html", "http://example.com/dir/r%C3%A9sum%C3%A9.html"),
+        ],
+    )
+    def test_normalize_link_url(self, href: str, expected: str) -> None:
+        response = HtmlResponse(
+            "http://example.com/dir/index.html",
+            body=f'<a href="{href}">x</a>'.encode(),
+        )
+        assert [link.url for link in LxmlLinkExtractor().extract_links(response)] == [
+            expected
+        ]
+
+    def test_normalize_keeps_repeated_slashes_of_other_schemes(self) -> None:
+        body = b"""
+        <html><body>
+        <a href="ftp://example.com//dir/">a</a>
+        <a href="s3://bucket//key/">b</a>
+        </body></html>
+        """
+        response = HtmlResponse(
+            "http://example.com/index.html", body=body, encoding="utf-8"
+        )
+        assert [
+            link.url
+            for link in LxmlLinkExtractor(
+                deny_extensions=(), schemes=("ftp", "s3")
+            ).extract_links(response)
+        ] == ["ftp://example.com//dir/", "s3://bucket//key/"]
+
     def test_extract_all_links(self):
         lx = LxmlLinkExtractor()
         page4_url = "http://example.com/page%204.html"
@@ -34,10 +108,6 @@ class TestLxmlLinkExtractor:
             Link(url="http://example.com/sample1.html", text=""),
             Link(url="http://example.com/sample2.html", text="sample 2"),
             Link(url="http://example.com/sample3.html", text="sample 3 text"),
-            Link(
-                url="http://example.com/sample3.html#foo",
-                text="sample 3 repetition with fragment",
-            ),
             Link(url="http://www.google.com/something", text=""),
             Link(url="http://example.com/innertag.html", text="inner tag"),
             Link(url=page4_url, text="href with whitespaces"),
@@ -49,10 +119,6 @@ class TestLxmlLinkExtractor:
             Link(url="http://example.com/sample1.html", text=""),
             Link(url="http://example.com/sample2.html", text="sample 2"),
             Link(url="http://example.com/sample3.html", text="sample 3 text"),
-            Link(
-                url="http://example.com/sample3.html#foo",
-                text="sample 3 repetition with fragment",
-            ),
         ]
 
     def test_extract_filter_allow_with_duplicates(self):
@@ -70,7 +136,7 @@ class TestLxmlLinkExtractor:
                 text="sample 3 repetition",
             ),
             Link(
-                url="http://example.com/sample3.html#foo",
+                url="http://example.com/sample3.html",
                 text="sample 3 repetition with fragment",
             ),
         ]
@@ -116,6 +182,26 @@ class TestLxmlLinkExtractor:
             Link(url="http://www.google.com/something", text=""),
         ]
 
+    @pytest.mark.parametrize(
+        ("href", "allowed"),
+        [
+            ("https://example.com/a", True),
+            ("https://sub.example.com/a", True),
+            ("https://EXAMPLE.COM/a", True),
+            ("https://SUB.EXAMPLE.COM/a", True),
+            ("https://notexample.com/a", False),
+            ("https://example.com.example/a", False),
+            ("https://example.org/a", False),
+        ],
+    )
+    def test_allowed_domains_include_subdomains(self, href: str, allowed: bool) -> None:
+        response = HtmlResponse(
+            "https://example.com/index.html",
+            body=f'<a href="{href}">x</a>'.encode(),
+        )
+        lx = LxmlLinkExtractor(allow_domains=("example.com",))
+        assert bool(lx.extract_links(response)) is allowed
+
     def test_extraction_using_single_values(self):
         """Test the extractor's behaviour among different situations"""
 
@@ -124,10 +210,6 @@ class TestLxmlLinkExtractor:
             Link(url="http://example.com/sample1.html", text=""),
             Link(url="http://example.com/sample2.html", text="sample 2"),
             Link(url="http://example.com/sample3.html", text="sample 3 text"),
-            Link(
-                url="http://example.com/sample3.html#foo",
-                text="sample 3 repetition with fragment",
-            ),
         ]
 
         lx = LxmlLinkExtractor(allow="sample", deny="3")
@@ -314,7 +396,7 @@ class TestLxmlLinkExtractor:
         lx = LxmlLinkExtractor()
         assert lx.extract_links(response) == [
             Link(
-                url="http://known.fm/AC%2FDC/?page=2",
+                url="http://known.fm/AC%2FDC?page=2",
                 text="BinB",
                 fragment="",
                 nofollow=False,
@@ -327,7 +409,7 @@ class TestLxmlLinkExtractor:
         lx = LxmlLinkExtractor(restrict_xpaths="//div")
         assert lx.extract_links(response) == [
             Link(
-                url="http://known.fm/AC%2FDC/?page=2",
+                url="http://known.fm/AC%2FDC?page=2",
                 text="BinB",
                 fragment="",
                 nofollow=False,
@@ -404,10 +486,6 @@ class TestLxmlLinkExtractor:
             Link(url="http://example.com/sample1.html", text=""),
             Link(url="http://example.com/sample2.html", text="sample 2"),
             Link(url="http://example.com/sample3.html", text="sample 3 text"),
-            Link(
-                url="http://example.com/sample3.html#foo",
-                text="sample 3 repetition with fragment",
-            ),
             Link(url="http://www.google.com/something", text=""),
             Link(url="http://example.com/innertag.html", text="inner tag"),
             Link(url=page4_url, text="href with whitespaces"),
@@ -421,10 +499,6 @@ class TestLxmlLinkExtractor:
             Link(url="http://example.com/sample2.html", text="sample 2"),
             Link(url="http://example.com/sample2.jpg", text=""),
             Link(url="http://example.com/sample3.html", text="sample 3 text"),
-            Link(
-                url="http://example.com/sample3.html#foo",
-                text="sample 3 repetition with fragment",
-            ),
             Link(url="http://www.google.com/something", text=""),
             Link(url="http://example.com/innertag.html", text="inner tag"),
             Link(url=page4_url, text="href with whitespaces"),
@@ -842,12 +916,10 @@ class TestLxmlLinkExtractor:
         monkeypatch.setattr(lxmlhtml, "canonicalize_url", counting_canonicalize_url)
         response = HtmlResponse(
             "https://example.com",
-            body=b"".join(b'<a href="/p?b=2&a=1#f%d">x</a>' % i for i in range(10)),
+            body=b"".join(b'<a href="/p?b=2&a=1&i=%d">x</a>' % i for i in range(10)),
         )
         lx = LxmlLinkExtractor(canonicalize=True)
-        assert lx.extract_links(response) == [
-            Link(url="https://example.com/p?a=1&b=2", text="x")
-        ]
+        assert len(lx.extract_links(response)) == 10
         assert len(calls) == 10
 
     def test_link_restrict_text(self):

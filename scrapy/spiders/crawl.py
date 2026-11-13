@@ -258,7 +258,9 @@ class CrawlSpider(Spider):
     def _requests_to_follow(self, response: Response) -> Iterable[Request | None]:
         if not isinstance(response, HtmlResponse):
             return
-        seen: set[Link] = set()
+        # Link URLs are normalized, so the URL identifies a link that an
+        # earlier rule may have already followed, whatever its text.
+        seen_urls: set[str] = set()
         response_rule_name = (
             response.request.meta.get("rule_name") if response.request else None
         )
@@ -271,10 +273,10 @@ class CrawlSpider(Spider):
             links: list[Link] = [
                 lnk
                 for lnk in rule.link_extractor.extract_links(response)
-                if lnk not in seen
+                if lnk.url not in seen_urls
             ]
             for link in cast("ProcessLinksT", rule.process_links)(links):
-                seen.add(link)
+                seen_urls.add(link.url)
                 request = self._build_request(rule_index, link)
                 yield cast("ProcessRequestT", rule.process_request)(request, response)
 

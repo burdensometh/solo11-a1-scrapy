@@ -253,6 +253,33 @@ class TestCrawlSpider(TestSpiderBase):
         output = list(spider._requests_to_follow(response))
         assert [r.meta["rule_name"] for r in output] == ["items"]
 
+    def test_links_shared_between_rules_are_followed_once(self):
+        response = HtmlResponse(
+            "http://example.org/somepage/index.html",
+            body=b"""
+            <a href="/about.html">About us</a>
+            <a href="/about.html#team">About the team</a>
+            <a href="//example.org/about.html">About</a>
+            <a href="/item/12.html">Item 12</a>
+            """,
+        )
+
+        class _CrawlSpider(self.spider_class):  # type: ignore[name-defined,misc]
+            name = "test"
+            allowed_domains = ["example.org"]
+            rules = (
+                Rule(LinkExtractor(allow=r"about"), name="about"),
+                Rule(LinkExtractor(allow=r"item"), name="items"),
+            )
+
+        spider = _CrawlSpider()
+        output = list(spider._requests_to_follow(response))
+        assert [r.url for r in output] == [
+            "http://example.org/about.html",
+            "http://example.org/item/12.html",
+        ]
+        assert [r.meta["rule_name"] for r in output] == ["about", "items"]
+
     def test_from_rules(self):
         response = HtmlResponse(
             "http://example.org/somepage/index.html", body=self.test_body

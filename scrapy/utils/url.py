@@ -133,6 +133,35 @@ def guess_scheme(url: str) -> str:
     return w3lib.url.add_http_if_no_scheme(url)
 
 
+def _normalize_url(url: str) -> str:
+    """Return the normalized form of *url*, to compare or deduplicate links.
+
+    Links that only differ in their fragment, in the case of their host, in
+    extra slashes, or in whether their path ends with a slash get the same
+    normalized form. The case of the path and the query component is kept as
+    it is, since servers can treat it as significant.
+    """
+    parsed_url = urlparse_cached(url)
+    scheme = parsed_url.scheme.lower()
+    netloc = parsed_url.netloc
+    path = parsed_url.path
+    if not netloc:
+        # URLs without an authority, like data: or mailto: ones, have no host
+        # to lowercase, and their fragment can be part of their payload.
+        return url
+    # Only the host is case-insensitive; the user information is not.
+    if "@" in netloc:
+        userinfo, host = netloc.rsplit("@", 1)
+        netloc = f"{userinfo}@{host.lower()}"
+    else:
+        netloc = netloc.lower()
+    # For HTTP and HTTPS, repeated slashes and a trailing slash in the path do
+    # not change the resource that the URL points to.
+    if scheme in {"http", "https"}:
+        path = re.sub(r"/+", "/", path).rstrip("/") or "/"
+    return urlunparse((scheme, netloc, path, parsed_url.params, parsed_url.query, ""))
+
+
 def strip_url(
     url: str,
     strip_credentials: bool = True,

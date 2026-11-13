@@ -23,15 +23,16 @@ RESPONSE_URL = "https://www.example.com/catalogue/page-1.html"
 # and with schemes other than HTTP and HTTPS are rejected, and, except in the
 # scenario that keeps duplicates, because the links that the navigation repeats
 # are collapsed.
-LINKS = 63
+LINKS = 61
 DUPLICATE_LINKS = 88
-CANONICAL_LINKS = 60
-FILTERED_LINKS = 45
+CANONICAL_LINKS = 59
+FILTERED_LINKS = 42
 
 # Requests built from LINKS links that point to a different resource.
 # Canonicalization maps the rest to one that another link already covers, e.g.
-# two fragments of a page, or two spellings of one percent-escape.
-FINGERPRINTS = 60
+# two spellings of one percent-escape, or two URLs of one page with and without
+# a trailing slash.
+FINGERPRINTS = 59
 
 
 def _read_corpus() -> tuple[list[str], list[str]]:

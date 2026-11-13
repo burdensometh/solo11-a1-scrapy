@@ -22,7 +22,7 @@ from scrapy.linkextractors import IGNORED_EXTENSIONS, _matches
 from scrapy.utils.httpobj import urlparse_cached
 from scrapy.utils.misc import arg_to_iter, rel_has_nofollow
 from scrapy.utils.python import unique as unique_list
-from scrapy.utils.url import url_is_from_any_domain
+from scrapy.utils.url import _normalize_url, url_is_from_any_domain
 
 if TYPE_CHECKING:
     from lxml.html import HtmlElement
@@ -154,6 +154,7 @@ class LxmlParserLinkExtractor:
 
             # to fix relative links after process_value
             url = urljoin(response_url, url)
+            url = _normalize_url(url)
             link = Link(
                 url,
                 _collect_string_content(el) or "",
@@ -188,6 +189,15 @@ _RegexOrSeveral: TypeAlias = _Regex | Iterable[_Regex]
 class LxmlLinkExtractor:
     r"""LxmlLinkExtractor is the recommended link extractor with handy filtering
     options. It is implemented using lxml's robust HTMLParser.
+
+    .. versionchanged:: VERSION
+       Extracted URLs are normalized.
+
+    Extracted URLs are normalized: fragments are removed, the host is
+    lowercased, repeated slashes are collapsed, a trailing slash is removed,
+    and relative URLs are resolved against the response URL. The case of the
+    path and the query component is kept, since servers can treat it as
+    significant.
 
     :param allow: a single regular expression (or list of regular expressions)
         that the (absolute) URLs must match in order to be extracted. If not
