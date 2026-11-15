@@ -871,6 +871,11 @@ The command line above can generate a directory tree like::
 Where the first and second files contain exactly 100 items. The last one contains
 100 items or fewer.
 
+When a crawl that uses :setting:`JOBDIR` is resumed, the batches that the
+previous run completed are not written again, and a batch that it left
+half-written is discarded: see :ref:`the feed exports section of the job
+documentation <topics-jobs-feed-exports>`.
+
 
 .. setting:: FEED_URI_PARAMS
 

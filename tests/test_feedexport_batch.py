@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, cast
 from unittest import mock
 from urllib.parse import urljoin
 
@@ -12,7 +13,13 @@ from packaging.version import Version
 import scrapy
 from scrapy import signals
 from scrapy.exceptions import NotConfigured
-from scrapy.extensions.feedexport import FeedExporter, FeedSlot, S3FeedStorage
+from scrapy.extensions.feedexport import (
+    FeedExporter,
+    FeedSlot,
+    S3FeedStorage,
+    _FeedManifest,
+    _local_path,
+)
 from scrapy.utils.misc import build_from_crawler
 from scrapy.utils.test import get_crawler
 from tests.spiders import ItemSpider
@@ -31,6 +38,32 @@ def build_url(path: str | PathLike[str]) -> str:
     if path_str[0] != "/":
         path_str = "/" + path_str
     return urljoin("file:", path_str)
+
+
+class MemoryFeedStorage:
+    """Keep feeds in memory under a URI scheme that is not the local
+    filesystem, so that tests can resume feeds whose targets cannot be
+    inspected or removed on disk."""
+
+    supported_modes = frozenset({"append", "create", "overwrite"})
+    targets: dict[str, bytes] = {}
+
+    def __init__(self, uri: str, *, feed_options: dict[str, Any] | None = None):
+        self.uri = uri
+        self.write_mode = (feed_options or {}).get("mode", "append")
+
+    def open(self, spider: scrapy.Spider) -> IO[bytes]:
+        return BytesIO()
+
+    def store(self, file: IO[bytes]) -> None:
+        data = cast("BytesIO", file).getvalue()
+        file.close()
+        if self.write_mode == "create" and self.uri in self.targets:
+            raise FileExistsError(self.uri)
+        if self.write_mode == "append":
+            self.targets[self.uri] = self.targets.get(self.uri, b"") + data
+        else:
+            self.targets[self.uri] = data
 
 
 async def export_batches(
@@ -369,6 +402,348 @@ class TestBatchDeliveries:
         ]
         assert sorted(p.name for p in dir_b.iterdir()) == ["1.jsonl", "2.jsonl"]
 
+    @coroutine_test
+    async def test_jobdir_resume_remote_partial_batch(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """The target of a batch in a remote storage cannot be removed, so a
+        batch that an interrupted run left half-written keeps its number and is
+        not written again on resume."""
+        uri_template = "memory://feeds/%(batch_id)d.jsonl"
+        MemoryFeedStorage.targets.clear()
+        settings: dict[str, Any] = {
+            "FEEDS": {uri_template: {"format": "jsonlines"}},
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+            "JOBDIR": str(tmp_path / "job"),
+            "FEED_STORAGES": {"memory": MemoryFeedStorage},
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        # Simulate a crash while batch 2 was being written: the remote storage
+        # has no partial target to remove, and the batch is not complete.
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        with manifest.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "feed": uri_template,
+                        "batch_id": 2,
+                        "uri": "memory://feeds/2.jsonl",
+                        "first_item": 2,
+                    }
+                )
+                + "\n"
+            )
+        await crawl_items(mockserver, [{"foo": "bar2"}], settings)
+        # Batch 2 kept its number but was not stored, so the new entries went
+        # to batch 3 instead.
+        assert "memory://feeds/3.jsonl" in MemoryFeedStorage.targets
+        assert MemoryFeedStorage.targets["memory://feeds/3.jsonl"] == (
+            b'{"foo": "bar2"}\n'
+        )
+
+    @coroutine_test
+    async def test_jobdir_resume_ignores_partial_batch(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A batch that an interrupted run left half-written is dropped, and
+        the resumed run starts a new batch after the last complete one, instead
+        of appending to the leftovers."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}, {"foo": "bar2"}], settings)
+        # Simulate a crash while batch 2 was being written: its file has one
+        # entry, and the manifest records the batch as started, not complete.
+        (dir_path / "2.jsonl").write_bytes(b'{"foo": "bar3"}\n')
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        with manifest.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "feed": build_url(dir_path / "%(batch_id)d.jsonl"),
+                        "batch_id": 2,
+                        "uri": build_url(dir_path / "2.jsonl"),
+                        "first_item": 3,
+                    }
+                )
+                + "\n"
+            )
+        await crawl_items(mockserver, [{"foo": "bar4"}, {"foo": "bar5"}], settings)
+        assert (dir_path / "1.jsonl").read_bytes() == (
+            b'{"foo": "bar1"}\n{"foo": "bar2"}\n'
+        )
+        assert (dir_path / "2.jsonl").read_bytes() == (
+            b'{"foo": "bar4"}\n{"foo": "bar5"}\n'
+        )
+        assert not (dir_path / "3.jsonl").exists()
+
+    @coroutine_test
+    async def test_jobdir_resume_reads_journal_events(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A manifest left by a run that was killed before it could compact it
+        is read back from its separate event lines: a batch start followed by
+        its completion, and a discarded batch."""
+        dir_path = unique_path(tmp_path)
+        uri_template = build_url(dir_path / "%(batch_id)d.jsonl")
+        settings: dict[str, Any] = {
+            "FEEDS": {uri_template: {"format": "jsonlines"}},
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        manifest.write_text(
+            "\n".join(
+                json.dumps(event)
+                for event in (
+                    {
+                        "feed": uri_template,
+                        "batch_id": 1,
+                        "uri": build_url(dir_path / "1.jsonl"),
+                        "first_item": 1,
+                    },
+                    {"feed": uri_template, "batch_id": 1, "item_count": 1},
+                    {
+                        "feed": uri_template,
+                        "batch_id": 2,
+                        "uri": build_url(dir_path / "2.jsonl"),
+                        "first_item": 2,
+                    },
+                    {"feed": uri_template, "batch_id": 2, "discard": True},
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        await crawl_items(mockserver, [{"foo": "bar2"}], settings)
+        # Batch 1 is complete and batch 2 was discarded, so its number is
+        # reused by the new entries.
+        assert (dir_path / "1.jsonl").read_bytes() == b'{"foo": "bar1"}\n'
+        assert (dir_path / "2.jsonl").read_bytes() == b'{"foo": "bar2"}\n'
+
+    @coroutine_test
+    async def test_jobdir_resume_after_compact(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """Each resumed run compacts the manifest into one line per batch, and
+        the run that follows still reads the batches back from those lines."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}, {"foo": "bar2"}], settings)
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        assert len(manifest.read_text(encoding="utf-8").splitlines()) == 1
+        await crawl_items(mockserver, [{"foo": "bar3"}, {"foo": "bar4"}], settings)
+        await crawl_items(mockserver, [{"foo": "bar5"}], settings)
+        assert (dir_path / "1.jsonl").read_bytes() == (
+            b'{"foo": "bar1"}\n{"foo": "bar2"}\n'
+        )
+        assert (dir_path / "2.jsonl").read_bytes() == (
+            b'{"foo": "bar3"}\n{"foo": "bar4"}\n'
+        )
+        assert (dir_path / "3.jsonl").read_bytes() == b'{"foo": "bar5"}\n'
+
+    @coroutine_test
+    async def test_jobdir_resume_keeps_stored_batches(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """Resuming a crawl never rewrites the batches that the previous run
+        already stored, so their entries are not exported twice."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(
+            mockserver, [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}], settings
+        )
+        await crawl_items(mockserver, [{"foo": "bar4"}], settings)
+        assert (dir_path / "1.jsonl").read_bytes() == (
+            b'{"foo": "bar1"}\n{"foo": "bar2"}\n'
+        )
+        assert (dir_path / "2.jsonl").read_bytes() == b'{"foo": "bar3"}\n'
+        assert (dir_path / "3.jsonl").read_bytes() == b'{"foo": "bar4"}\n'
+
+    @coroutine_test
+    async def test_jobdir_resume_manifest(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """The feed manifest records the URI, the entry range and the entry
+        count of every stored batch, so that they can be looked up."""
+        dir_path = unique_path(tmp_path)
+        uri_template = build_url(dir_path / "%(batch_id)d.jsonl")
+        settings: dict[str, Any] = {
+            "FEEDS": {uri_template: {"format": "jsonlines"}},
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(
+            mockserver, [{"foo": "bar1"}, {"foo": "bar2"}, {"foo": "bar3"}], settings
+        )
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        records = [
+            json.loads(line)
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+        ]
+        assert records == [
+            {
+                "feed": uri_template,
+                "batch_id": 1,
+                "uri": build_url(dir_path / "1.jsonl"),
+                "first_item": 1,
+                "last_item": 2,
+                "item_count": 2,
+                "complete": True,
+                "pre_existing": False,
+            },
+            {
+                "feed": uri_template,
+                "batch_id": 2,
+                "uri": build_url(dir_path / "2.jsonl"),
+                "first_item": 3,
+                "last_item": 3,
+                "item_count": 1,
+                "complete": True,
+                "pre_existing": False,
+            },
+        ]
+
+    @coroutine_test
+    async def test_jobdir_resume_ignores_corrupt_manifest_line(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A run killed while appending to the manifest leaves a partial last
+        line; the next run ignores it and resumes from the complete records
+        before it."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}, {"foo": "bar2"}], settings)
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        with manifest.open("a", encoding="utf-8") as f:
+            f.write('{"feed": "file:///partial", "batch_id":')
+        await crawl_items(mockserver, [{"foo": "bar3"}], settings)
+        assert (dir_path / "2.jsonl").read_bytes() == b'{"foo": "bar3"}\n'
+        # The complete record of batch 1 survived the corrupted line.
+        records = [
+            json.loads(line)
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.endswith("}")
+        ]
+        assert [r["batch_id"] for r in records if "discard" not in r] == [1, 2]
+
+    @coroutine_test
+    async def test_jobdir_resume_ignores_garbage_manifest(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A manifest with lines that are not feed records is ignored, and the
+        resume proceeds as if it were empty instead of failing the crawl."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        with manifest.open("w", encoding="utf-8") as f:
+            for line in ("[]", "{}", '{"feed": 1, "batch_id": "x"}', "not json"):
+                f.write(line + "\n")
+        await crawl_items(mockserver, [{"foo": "bar2"}], settings)
+        # The unusable lines are ignored, and resume falls back to the batch
+        # ID in spider.state, so the new entries do not overwrite batch 1.
+        assert (dir_path / "1.jsonl").read_bytes() == b'{"foo": "bar1"}\n'
+        assert (dir_path / "2.jsonl").read_bytes() == b'{"foo": "bar2"}\n'
+
+    @coroutine_test
+    async def test_jobdir_resume_keeps_preexisting_target(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A batch whose target already existed before an interrupted run
+        started writing it is not removed on resume, even though the run left
+        it half-written: it is not the run's to delete."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}, {"foo": "bar2"}], settings)
+        # Simulate a crash during batch 2 after appending to a target that
+        # already existed (e.g. a resumed run over a stale file).
+        (dir_path / "2.jsonl").write_bytes(b"previous\n")
+        manifest = tmp_path / "job" / "feed_manifest.json"
+        with manifest.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "feed": build_url(dir_path / "%(batch_id)d.jsonl"),
+                        "batch_id": 2,
+                        "uri": build_url(dir_path / "2.jsonl"),
+                        "first_item": 3,
+                        "pre_existing": True,
+                    }
+                )
+                + "\n"
+            )
+        await crawl_items(mockserver, [{"foo": "bar3"}, {"foo": "bar4"}], settings)
+        # The pre-existing target was left untouched, and the new entries
+        # went to a new batch instead of into it.
+        assert (dir_path / "2.jsonl").read_bytes() == b"previous\n"
+        assert (dir_path / "3.jsonl").read_bytes() == (
+            b'{"foo": "bar3"}\n{"foo": "bar4"}\n'
+        )
+
+    @coroutine_test
+    async def test_jobdir_resume_without_manifest(
+        self, mockserver: MockServer, tmp_path: Path
+    ) -> None:
+        """A job directory written by a Scrapy version that did not keep a feed
+        manifest resumes from the batch ID in the spider state instead."""
+        dir_path = unique_path(tmp_path)
+        settings: dict[str, Any] = {
+            "FEEDS": {
+                build_url(dir_path / "%(batch_id)d.jsonl"): {"format": "jsonlines"}
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+            "JOBDIR": str(tmp_path / "job"),
+        }
+        await crawl_items(mockserver, [{"foo": "bar1"}], settings)
+        (tmp_path / "job" / "feed_manifest.json").unlink()
+
+        batch_ids: list[int] = []
+
+        def on_initialized(slots: list[FeedSlot]) -> None:
+            batch_ids.extend(slot.batch_id for slot in slots)
+
+        crawler = get_crawler(settings_dict=settings)
+        crawler.signals.connect(on_initialized, signals.feed_slots_initialized)
+        await crawler.crawl_async()
+        assert batch_ids == [2]
+
     @pytest.mark.parametrize(
         ("jobdir", "batch_id"), [(False, 1), (True, 3)], ids=["no-jobdir", "resume"]
     )
@@ -531,3 +906,43 @@ class TestBatchDeliveries:
             assert call.kwargs["Bucket"] == bucket
         assert crawler.stats
         assert crawler.stats.get_value("feedexport/success_count/S3FeedStorage") == 3
+
+
+class TestFeedManifestErrors:
+    """The feed manifest is auxiliary: failures to read or write it are logged
+    and the crawl goes on without it."""
+
+    def test_unreadable(self, tmp_path: Path) -> None:
+        path = tmp_path / "feed_manifest.json"
+        path.mkdir()
+        assert _FeedManifest(path).shards("file:///x") == []
+
+    def test_unwritable(self, tmp_path: Path) -> None:
+        path = tmp_path / "feed_manifest.json"
+        path.mkdir()
+        manifest = _FeedManifest(path)
+        # A write failure is logged, not raised, and recording continues to be
+        # possible once the file is writable again.
+        manifest.begin_shard("file:///x", 1, "file:///x/1.jsonl", 1)
+        manifest.complete_shard("file:///x", 1, 2)
+        assert manifest.next_batch_id("file:///x") == 2
+
+    def test_non_local_uri(self) -> None:
+        assert _local_path("s3://bucket/1.jsonl") is None
+        assert _local_path("file:///tmp/1.jsonl") == Path("/tmp/1.jsonl")
+        assert _local_path("/tmp/1.jsonl") == Path("/tmp/1.jsonl")
+
+    def test_unremovable_partial_target(self, tmp_path: Path) -> None:
+        """A partial file that cannot be removed keeps the sequence number of
+        its batch, so that the resumed run does not write over it."""
+        shard = {"uri": "file:///tmp/partial.jsonl", "pre_existing": False}
+        with mock.patch.object(Path, "unlink", side_effect=OSError("denied")):
+            assert FeedExporter._remove_partial_target(shard, mock.MagicMock()) is False
+
+    def test_missing_partial_target(self, tmp_path: Path) -> None:
+        """A partial file that is already gone is treated as removed."""
+        shard = {
+            "uri": f"file://{tmp_path}/missing.jsonl",
+            "pre_existing": False,
+        }
+        assert FeedExporter._remove_partial_target(shard, mock.MagicMock()) is True

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import sys
@@ -31,7 +32,7 @@ from scrapy.extensions.postprocessing import PostProcessingManager
 from scrapy.utils._ftp import ftp_store_file
 from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
 from scrapy.utils.boto import _get_max_pool_connections, is_aioboto3_available
-from scrapy.utils.conf import feed_complete_default_values_from_settings
+from scrapy.utils.conf import _job_dir, feed_complete_default_values_from_settings
 from scrapy.utils.defer import (
     _maybe_coroutine,
     deferred_from_coro,
@@ -89,6 +90,8 @@ _ItemProcessor: TypeAlias = Callable[[Any], Iterable[Any]]
 
 _FEED_MODES: frozenset[str] = frozenset({"append", "create", "overwrite"})
 
+_MANIFEST_FILENAME = "feed_manifest.json"
+
 
 def _get_mode(storage: Any, feed_options: dict[str, Any] | None, legacy: str) -> str:
     """Return the mode of *storage*, based on the *mode* feed option, or on the
@@ -117,6 +120,189 @@ def _check_mode(mode: str, storage: Any, uri: str | None = None) -> None:
             f"{type(storage).__name__} does not support the {mode!r} feed "
             f"mode{suffix}. Supported modes: {', '.join(sorted(supported))}."
         )
+
+
+def _local_path(uri: str) -> Path | None:
+    """Return the local filesystem path of *uri*, or ``None`` if *uri* points
+    to another storage backend."""
+    if uri.startswith("file:"):
+        return Path(file_uri_to_path(uri))
+    if urlparse(uri).scheme and not PureWindowsPath(uri).drive:
+        return None
+    return Path(uri)
+
+
+class _FeedManifest:
+    """Record the batches of each feed of a job, their target URI, the range
+    of exported entries that they cover, and whether they were completely
+    stored.
+
+    Events are appended to a JSON Lines file as they happen, so an interrupted
+    run loses at most the last, partial line, and the next run can tell the
+    complete batches from the interrupted ones. On a clean close the file is
+    rewritten with one final line per batch, which makes it directly readable.
+    """
+
+    def __init__(self, path: Path):
+        self.path: Path = path
+        self._file: IO[str] | None = None
+        self._feeds: dict[str, dict[int, dict[str, Any]]] = self._load()
+
+    def _load(self) -> dict[str, dict[int, dict[str, Any]]]:
+        feeds: dict[str, dict[int, dict[str, Any]]] = {}
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return feeds
+        except OSError as e:
+            logger.error(f"Could not read the feed manifest {self.path}: {e}")
+            return feeds
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                # A run killed while appending leaves a partial last line.
+                continue
+            if not isinstance(event, dict):
+                continue
+            feed, batch_id = event.get("feed"), event.get("batch_id")
+            if not isinstance(feed, str) or not isinstance(batch_id, int):
+                continue
+            shards = feeds.setdefault(feed, {})
+            if isinstance(event.get("uri"), str) and isinstance(
+                event.get("first_item"), int
+            ):
+                first_item = event["first_item"]
+                item_count = event.get("item_count")
+                shards[batch_id] = {
+                    "batch_id": batch_id,
+                    "uri": event["uri"],
+                    "first_item": first_item,
+                    "last_item": first_item - 1,
+                    "item_count": 0,
+                    "complete": False,
+                    "pre_existing": bool(event.get("pre_existing")),
+                }
+                if isinstance(item_count, int) and event.get("complete"):
+                    shards[batch_id]["item_count"] = item_count
+                    shards[batch_id]["last_item"] = first_item + item_count - 1
+                    shards[batch_id]["complete"] = True
+            elif event.get("discard"):
+                shards.pop(batch_id, None)
+            elif isinstance(event.get("item_count"), int) and batch_id in shards:
+                shard = shards[batch_id]
+                shard["item_count"] = event["item_count"]
+                shard["last_item"] = shard["first_item"] + event["item_count"] - 1
+                shard["complete"] = True
+        return feeds
+
+    def shards(self, uri_template: str) -> list[dict[str, Any]]:
+        return sorted(
+            self._feeds.get(uri_template, {}).values(), key=lambda s: s["batch_id"]
+        )
+
+    def complete_shards(self, uri_template: str) -> list[dict[str, Any]]:
+        return [s for s in self.shards(uri_template) if s["complete"]]
+
+    def next_batch_id(self, uri_template: str) -> int:
+        """Return the sequence number of the batch that a resumed crawl must
+        start with: the one after the last recorded batch.
+
+        Batches that are recorded but were not completely stored still count
+        here, because their target may be left behind and must not be written
+        again."""
+        return max((s["batch_id"] for s in self.shards(uri_template)), default=0) + 1
+
+    def next_item_index(self, uri_template: str) -> int:
+        """Return the 1-based index of the first exported entry that a resumed
+        crawl must write: the one after the entries of the completely stored
+        batches."""
+        return (
+            max((s["last_item"] for s in self.complete_shards(uri_template)), default=0)
+            + 1
+        )
+
+    def begin_shard(
+        self,
+        uri_template: str,
+        batch_id: int,
+        uri: str,
+        first_item: int,
+        *,
+        pre_existing: bool = False,
+    ) -> None:
+        """Record that the batch *batch_id* of *uri_template* is being written
+        to *uri*, starting with the exported entry *first_item*.
+
+        *pre_existing* tells whether *uri* already existed, so that a later run
+        never removes a target that this run did not create."""
+        self._feeds.setdefault(uri_template, {}).pop(batch_id, None)
+        self._feeds[uri_template][batch_id] = {
+            "batch_id": batch_id,
+            "uri": uri,
+            "first_item": first_item,
+            "last_item": first_item - 1,
+            "item_count": 0,
+            "complete": False,
+            "pre_existing": pre_existing,
+        }
+        self._append(
+            {
+                "feed": uri_template,
+                "batch_id": batch_id,
+                "uri": uri,
+                "first_item": first_item,
+                "pre_existing": pre_existing,
+            }
+        )
+
+    def complete_shard(self, uri_template: str, batch_id: int, item_count: int) -> None:
+        """Record that the batch *batch_id* of *uri_template* was completely
+        stored, with *item_count* exported entries."""
+        shard = self._feeds[uri_template][batch_id]
+        shard["item_count"] = item_count
+        shard["last_item"] = shard["first_item"] + item_count - 1
+        shard["complete"] = True
+        self._append(
+            {"feed": uri_template, "batch_id": batch_id, "item_count": item_count}
+        )
+
+    def incomplete_shards(self, uri_template: str) -> list[dict[str, Any]]:
+        """Return the batches of *uri_template* that were not completely
+        stored, e.g. because the run that was writing them was interrupted."""
+        return [s for s in self.shards(uri_template) if not s["complete"]]
+
+    def forget_shard(self, uri_template: str, batch_id: int) -> None:
+        """Forget the batch *batch_id* of *uri_template*, because its target
+        was removed and its sequence number can be used again."""
+        shards = self._feeds.get(uri_template)
+        if shards is not None and shards.pop(batch_id, None) is not None:
+            self._append({"feed": uri_template, "batch_id": batch_id, "discard": True})
+
+    def compact(self) -> None:
+        """Replace the journal with one final line per recorded batch."""
+        if self._file is None:
+            return
+        self._file.close()
+        self._file = None
+        tmp_path = self.path.with_name(self.path.name + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            for uri_template in sorted(self._feeds):
+                for shard in self.shards(uri_template):
+                    f.write(json.dumps({"feed": uri_template, **shard}) + "\n")
+        tmp_path.replace(self.path)
+
+    def _append(self, event: dict[str, Any]) -> None:
+        try:
+            if self._file is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._file = self.path.open("a", encoding="utf-8")
+            self._file.write(json.dumps(event) + "\n")
+            self._file.flush()
+        except OSError as e:
+            # The manifest is auxiliary: a crawl must go on without it.
+            logger.error(f"Could not update the feed manifest {self.path}: {e}")
+            self._file = None
 
 
 class ItemFilter:
@@ -601,12 +787,17 @@ class FeedSlot:
         exporters: dict[str, type[BaseItemExporter]],
         settings: BaseSettings,
         crawler: Crawler,
+        *,
+        first_item: int = 1,
+        manifest: _FeedManifest | None = None,
     ):
         self.file: IO[bytes] | None = None
         self.exporter: BaseItemExporter | None = None
         self.storage: FeedStorageProtocol = storage
         # feed params
         self.batch_id: int = batch_id
+        # 1-based index of the first exported entry of this batch.
+        self.first_item: int = first_item
         self.format: str = format
         self.store_empty: bool = store_empty
         self.uri_template: str = uri_template
@@ -618,14 +809,28 @@ class FeedSlot:
         self.exporters: dict[str, type[BaseItemExporter]] = exporters
         self.settings: BaseSettings = settings
         self.crawler: Crawler = crawler
+        self.manifest: _FeedManifest | None = manifest
         # flags
         self.itemcount: int = 0
         self._skipped: bool = False
         self._exporting: bool = False
         self._fileloaded: bool = False
+        self._started: bool = False
 
     async def start_exporting(self) -> None:
         if not self._fileloaded:
+            if self.manifest is not None and not self._started:
+                # Recorded before writing anything, so that an interrupted run
+                # leaves a record of the batch that must be discarded, and of
+                # whether it is safe to remove its partial target.
+                self.manifest.begin_shard(
+                    self.uri_template,
+                    self.batch_id,
+                    self.uri,
+                    self.first_item,
+                    pre_existing=self._target_exists(),
+                )
+                self._started = True
             self.file = await _maybe_coroutine(self.storage.open, self.spider)
             if "postprocessing" in self.feed_options:
                 self.file = cast(
@@ -650,6 +855,13 @@ class FeedSlot:
             assert self.exporter
             await _maybe_coroutine(self.exporter.start_exporting)
             self._exporting = True
+
+    def _target_exists(self) -> bool:
+        """Return whether the target of the batch already exists. Local files
+        can be checked before opening them; other storages cannot, and are
+        treated as not pre-existing."""
+        path = _local_path(self.uri)
+        return path is not None and path.exists()
 
     def _get_exporter(
         self, file: IO[bytes], format_: str, *args: Any, **kwargs: Any
@@ -755,6 +967,13 @@ class FeedExporter:
             if not self._exporter_supported(feed_options["format"]):
                 raise NotConfigured
 
+        # The manifest lives in the job directory, which is what makes a crawl
+        # resumable; without a job directory there is nothing to resume.
+        jobdir = _job_dir(self.settings)
+        self.manifest: _FeedManifest | None = (
+            _FeedManifest(Path(jobdir, _MANIFEST_FILENAME)) if jobdir else None
+        )
+
     def open_spider(self, spider: Spider) -> None:
         self._slots_initialized = False
         for uri, feed_options in self.feeds.items():
@@ -769,15 +988,85 @@ class FeedExporter:
                     f"function."
                 )
                 continue
+            batch_id = 1
+            first_item = 1
+            manifest = self._manifest_for(uri)
+            if manifest is not None:
+                # A batch that a previous run left half-written is not a
+                # batch: remove its partial file and forget it, so that the
+                # resumed run starts it again instead of appending to it.
+                for shard in manifest.incomplete_shards(uri):
+                    if self._remove_partial_target(shard, spider):
+                        manifest.forget_shard(uri, shard["batch_id"])
+                # Continue after the last batch that was completely stored,
+                # with the entries that follow the ones it already covers.
+                batch_id = manifest.next_batch_id(uri)
+                first_item = manifest.next_item_index(uri)
             self.slots.append(
                 self._start_new_batch(
-                    batch_id=1,
-                    uri=resolved_uri,
+                    batch_id=batch_id,
+                    uri=self._batch_uri(resolved_uri, batch_id, uri),
                     feed_options=feed_options,
                     spider=spider,
                     uri_template=uri,
+                    first_item=first_item,
                 )
             )
+
+    def _manifest_for(self, uri_template: str) -> _FeedManifest | None:
+        """Return the manifest that tracks *uri_template*, if resuming a crawl
+        applies to it, i.e. if the crawl has a job directory to be resumed
+        from and the feed is written in batches."""
+        if self.manifest is None or not self.feeds[uri_template]["batch_item_count"]:
+            return None
+        return self.manifest
+
+    @staticmethod
+    def _remove_partial_target(shard: dict[str, Any], spider: Spider) -> bool:
+        """Remove the file of a batch that a previous run left half-written,
+        and return whether its sequence number is now free to be reused.
+
+        The file is only removed if it is in the local filesystem, so that a
+        run does not append to a corrupt file, and if the previous run created
+        it, i.e. it did not exist before that run started writing it. A remote
+        target, or one that already existed, is left as it is, and its
+        sequence number is not reused either, so that nothing is ever written
+        over it."""
+        if shard.get("pre_existing"):
+            return False
+        uri = shard.get("uri")
+        path = _local_path(uri) if isinstance(uri, str) else None
+        if path is None:
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.error(f"Could not remove the partial feed file {path}: {e}")
+            return False
+        else:
+            logger.warning(
+                f"Removed the partial feed file {path} of an interrupted run; "
+                "its items were not exported.",
+                extra={"spider": spider},
+            )
+        return True
+
+    def _batch_uri(self, resolved_uri: str, batch_id: int, uri_template: str) -> str:
+        """Return the URI of the batch *batch_id* of *uri_template*.
+
+        *resolved_uri* is the URI of batch 1, already resolved with the URI
+        parameters of the spider, and is reused for it verbatim."""
+        if batch_id == 1:
+            return resolved_uri
+        spider = self.crawler.spider
+        assert spider is not None
+        uri_params = self._get_uri_params(
+            spider, self.feeds[uri_template]["uri_params"]
+        )
+        uri_params["batch_id"] = batch_id
+        return apply_uri_params(uri_template, uri_params)
 
     async def _on_state_loaded(self, state: dict[str, Any]) -> None:
         """Update initial batch-1 slots with the correct resumed batch IDs.
@@ -791,6 +1080,13 @@ class FeedExporter:
             spider = self.crawler.spider
             assert spider is not None
             for slot in self.slots:
+                if self.manifest is not None and self.manifest.shards(
+                    slot.uri_template
+                ):
+                    # The manifest is more precise than spider.state: it also
+                    # tells complete batches from interrupted ones, and it
+                    # already placed the slot at the right batch.
+                    continue
                 saved_id = feed_batch_ids.get(slot.uri_template, 0)
                 if saved_id == 0:
                     continue
@@ -820,6 +1116,10 @@ class FeedExporter:
 
         Called via the spider_state_saving signal before SpiderState writes
         spider.state to disk, so the next run can resume from the right batch.
+        When the feed manifest of the job directory has records for a feed, it
+        is the source of truth for resuming it, and this value is only a
+        fallback for job directories written by a Scrapy version that did not
+        have a manifest.
         """
         feed_batch_ids = state.setdefault("feed_batch_ids", {})
         for slot in self.slots:
@@ -857,6 +1157,9 @@ class FeedExporter:
 
         # Send FEED_EXPORTER_CLOSED signal
         await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
+
+        if self.manifest is not None:
+            self.manifest.compact()
 
     def _schedule_slot_close(
         self, slot: FeedSlot, spider: Spider
@@ -923,6 +1226,10 @@ class FeedExporter:
         else:
             logger.info("Stored %s", logmsg, extra={"spider": spider})
             self.crawler.stats.inc_value(f"feedexport/success_count/{slot_type}")
+            if slot.manifest is not None:
+                slot.manifest.complete_shard(
+                    slot.uri_template, slot.batch_id, slot.itemcount
+                )
 
         await self.crawler.signals.send_catch_log_async(
             signals.feed_slot_closed, slot=slot
@@ -935,6 +1242,7 @@ class FeedExporter:
         feed_options: dict[str, Any],
         spider: Spider,
         uri_template: str,
+        first_item: int = 1,
     ) -> FeedSlot:
         """
         Redirect the output data stream to a new file.
@@ -944,6 +1252,7 @@ class FeedExporter:
         :param feed_options: dict with parameters of feed
         :param spider: user spider
         :param uri_template: template of uri which contains %(batch_time)s or %(batch_id)d to create new uri
+        :param first_item: 1-based index of the first exported entry of the batch
         """
         storage = self._get_storage(uri, feed_options)
         return FeedSlot(
@@ -959,6 +1268,8 @@ class FeedExporter:
             exporters=self.exporters,
             settings=self.settings,
             crawler=self.crawler,
+            first_item=first_item,
+            manifest=self._manifest_for(uri_template),
         )
 
     async def item_scraped(self, item: Any, spider: Spider) -> None:
@@ -1015,6 +1326,7 @@ class FeedExporter:
                         feed_options=self.feeds[slot.uri_template],
                         spider=spider,
                         uri_template=slot.uri_template,
+                        first_item=slot.first_item + slot.itemcount,
                     )
             slots.append(slot)
         self.slots = slots

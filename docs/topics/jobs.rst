@@ -117,11 +117,34 @@ new job directory.
 Feed exports
 ------------
 
+.. _topics-jobs-feed-exports:
+
 When a job is resumed, the :ref:`feeds <topics-feed-exports>` of the previous
 run already exist, so their :ref:`mode <feed-mode>` determines what happens to
 the items of the resumed run: ``"append"`` adds them to those feeds,
 ``"overwrite"`` replaces the items of the previous run with them, and
 ``"create"`` does not write them anywhere.
+
+Batched feeds, i.e. those that set
+:setting:`FEED_EXPORT_BATCH_ITEM_COUNT` or the ``batch_item_count`` feed
+option, are resumed from the last batch that was completely stored:
+
+-   Batches stored by the previous run are not written again, and their
+    entries are not exported again.
+-   A batch that the previous run left half-written is discarded, including
+    its partial file if it is in the local filesystem and did not exist before
+    that run, and the resumed run starts a new batch instead of appending to
+    it.
+
+The job directory keeps a ``feed_manifest.json`` file that records, for every
+batch, its sequence number, target URI, the 1-based indexes of its first and
+last exported entries, and the number of entries, with one JSON object per
+line. A batch is recorded as ``"complete": true`` once it has been stored, and
+the file can be inspected to look up which entries each batch covers.
+
+.. versionchanged:: VERSION
+   Resuming a batched feed no longer overwrites the batches that the previous
+   run stored, and no longer appends to the batch that it left half-written.
 
 Cookie expiration
 -----------------
